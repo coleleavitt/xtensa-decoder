@@ -237,3 +237,79 @@ WRONG (current firmware):          CORRECT (required):
 
 A barrier BEFORE only ensures previous stores are visible - it does NOT
 flush the current store to memory.
+
+---
+
+## IDA Pro Verification (ARM Driver)
+
+The ARM driver barriers were verified via IDA Pro decompilation:
+
+### WAR_CE_SRC_RING_WRITE_IDX_SET @ 0x0003dfbc
+
+```c
+int WAR_CE_SRC_RING_WRITE_IDX_SET(int result, _DWORD *a2, int a3, int a4)
+{
+  if ( war1 == 0 )
+    return WAR_PCI_WRITE32(...);
+    
+  // Critical section with multiple barriers:
+  __dsb(0xEu);                    // Store barrier
+  *v5 = a4 | 0xCEEF0000;
+  
+  // OR in the else path:
+  CPSR = __get_CPSR();
+  __disable_irq();                // Disable interrupts
+  __dsb(0xEu);                    // Store barrier
+  *v5 = 1;
+  __dsb(0xFu);                    // Full system barrier
+  __dsb(0xFu);                    // Full system barrier (again!)
+  result = WAR_PCI_WRITE32(...);
+  __dsb(0xEu);                    // Store barrier
+  *v5 = 0;
+  __set_CPSR(CPSR);
+  return result;
+}
+```
+
+### WAR_PCI_WRITE32 @ 0x0002ab90
+
+```c
+int WAR_PCI_WRITE32(int result, int a2, int a3)
+{
+  if ( war1 != 0 )
+  {
+    raw_spin_lock_irqsave(&pciwar_lock);
+    __dsb(0xFu);                  // Full barrier
+    __dsb(0xFu);                  // Full barrier (again!)
+    v7 = *(_DWORD *)(v3 + a2 + 4); // Dummy read (bus sync)
+    __dsb(0xFu);                  // Full barrier
+    __dsb(0xEu);                  // Store barrier
+    *(_DWORD *)(v3 + a2) = a3;    // Actual write
+    raw_spin_unlock_irqrestore(&pciwar_lock, ...);
+  }
+  else
+  {
+    __dsb(0xEu);                  // Store barrier
+    *(_DWORD *)(result + a2) = a3;
+  }
+}
+```
+
+### Barrier Count in ARM TX Path
+
+| Function | __dsb() calls | Spinlocks | IRQ disable |
+|----------|---------------|-----------|-------------|
+| WAR_CE_SRC_RING_WRITE_IDX_SET | 4 | 0 | 1 |
+| WAR_PCI_WRITE32 | 5 | 1 | 1 |
+| CE_send | 2 | 1 | 0 |
+| **TOTAL** | **11+** | **2** | **2** |
+
+### Contrast with Xtensa Firmware
+
+| Component | Barrier calls | Notes |
+|-----------|---------------|-------|
+| ARM Driver TX path | 11+ __dsb() | Correct |
+| Xtensa TX path | 0 memw | **BUG** |
+
+The ARM driver developers clearly understood the DMA coherency requirements.
+The Xtensa firmware developers did not apply equivalent barriers.

@@ -12,9 +12,10 @@
 
 Analysis of the Qualcomm QCA4019 WiFi firmware (Tensilica Xtensa) in Ruckus access points reveals **systemic DMA coherency bugs** that cause data corruption during WiFi transmissions:
 
-- **3 stores to DMA descriptor chain pointer (offset 844)** - ALL lack AFTER barriers (100% bug rate)
-- **227 stores to DMA descriptor fields (offsets 0-48, 844)** lack memory barriers within 30 bytes AFTER the store
-- **98.7% overall bug rate** for DMA descriptor stores
+- **15,099 out of 15,785 (95.7%)** stores to DMA descriptor fields lack memory barriers AFTER the store
+- **1,853 functions** contain unprotected DMA descriptor stores
+- **Top functions have 50-73 unprotected stores each** with 100% bug rate
+- **All 3 stores to DMA chain pointer (offset 844)** lack AFTER barriers
 
 The critical issue: barriers placed BEFORE stores only flush previous operations. DMA coherency requires barriers AFTER stores to ensure the current store is visible to hardware.
 
@@ -274,14 +275,16 @@ The conditional branches checking specific bit patterns (e.g., `bbci a8, 3` - bi
 
 ## Appendix: Statistical Summary (VALIDATED)
 
+### Overall Statistics
 | Metric | Value |
 |--------|-------|
 | Total `memw` barriers in firmware | 632 |
 | Barrier encoding | `c0 20 00` (little-endian) |
-| Stores to offset 844 (DMA ptr) | **3** |
-| Stores to DMA descriptor fields (0-48, 844) | **230** |
-| Stores WITHOUT AFTER barrier | **227 (98.7%)** |
-| Stores WITH AFTER barrier | 3 (1.3%) |
+| Total functions in firmware | 2,880 |
+| Functions with DMA stores | 1,853 |
+| **Total DMA descriptor stores** | **15,785** |
+| **Stores WITHOUT AFTER barrier** | **15,099 (95.7%)** |
+| Stores WITH AFTER barrier | 686 (4.3%) |
 | Barrier search radius | 30 bytes AFTER store |
 
 ### The Critical Bug Pattern
@@ -295,20 +298,24 @@ The firmware places barriers BEFORE stores but not AFTER:
 ; NO BARRIER AFTER - DMA reads stale value!
 ```
 
+### Most Dangerous Functions (0 barriers, many unprotected DMA stores)
+
+| Rank | Address | Unprotected/Total | Bug Rate |
+|------|---------|-------------------|----------|
+| 1 | 0x0042bb4a | 73/73 | 100% |
+| 2 | 0x0041fd67 | 65/65 | 100% |
+| 3 | 0x00446891 | 64/64 | 100% |
+| 4 | 0x0043b2cf | 63/63 | 100% |
+| 5 | 0x00448293 | 62/64 | 97% |
+| 6 | 0x0040a87c | 60/60 | 100% |
+| 7 | 0x00409761 | 58/58 | 100% |
+| 8 | 0x0041f76c | 56/56 | 100% |
+| 9 | 0x00441304 | 53/56 | 95% |
+| 10 | 0x00441666 | 51/57 | 89% |
+
 ### All 3 Stores to Offset 844 (chain pointer)
 ```
 0x004181f7: s32i a12, a13, 844  ; BEFORE: memw at -41  | AFTER: NONE | BUG
 0x004214c0: s32i a15, a12, 844  ; BEFORE: NONE         | AFTER: NONE | BUG
 0x0044e24d: s32i a10, a11, 844  ; BEFORE: memw at -20  | AFTER: NONE | BUG
 ```
-
-### DMA Descriptor Field Bug Summary
-
-| Offset | Description | Unprotected | Protected | Bug Rate |
-|--------|-------------|-------------|-----------|----------|
-| 0 | Descriptor base | 54 | 0 | 100% |
-| 4 | Next ptr/length | 29 | 1 | 97% |
-| 8 | Buffer ptr | 17 | 0 | 100% |
-| 12-48 | Control fields | 124 | 0 | 100% |
-| 844 | Chain pointer | 1 | 2 | 33% |
-| **Total** | | **227** | **3** | **98.7%** |

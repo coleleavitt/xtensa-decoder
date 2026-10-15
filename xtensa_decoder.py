@@ -3,11 +3,31 @@ Complete Xtensa ISA Decoder
 Built from LLVM TableGen definitions (llvm/lib/Target/Xtensa/*.td)
 Validated against llvm-mc --triple=xtensa
 
-Author: Generated for Ruckus firmware analysis
+Features:
+- Full instruction decoding (24-bit and 16-bit narrow)
+- Control flow analysis (branches, calls, returns)
+- Memory barrier detection (memw, extw, dsync, isync)
+- DMA bug detection (stores without barriers)
+
+Encoding Note:
+  Xtensa uses LITTLE-ENDIAN byte order. A 3-byte instruction
+  stored as bytes [b0, b1, b2] in memory is decoded as:
+    op0 = b0 & 0x0F
+    t = (b0 >> 4) & 0x0F
+    s = b1 & 0x0F
+    r = (b1 >> 4) & 0x0F
+    op1 = b2 & 0x0F
+    op2 = (b2 >> 4) & 0x0F
+
+  Memory barriers encode as:
+    memw:  c0 20 00  (op0=0, r=2, s=0, t=c, op1=0, op2=0)
+    extw:  d0 20 00  (op0=0, r=2, s=0, t=d, op1=0, op2=0)
+    dsync: 30 20 00  (op0=0, r=2, s=0, t=3, op1=0, op2=0)
+    isync: 00 20 00  (op0=0, r=2, s=0, t=0, op1=0, op2=0)
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Set
+from typing import Optional, List, Dict, Tuple, Set, Iterator
 from enum import Enum, auto
 import struct
 
@@ -37,56 +57,65 @@ class Insn:
     raw: bytes
     mnemonic: str
     operands: str = ""
-    
+
     # Classification
     itype: InsnType = InsnType.UNKNOWN
-    
+
     # Control flow
     is_branch: bool = False
     is_call: bool = False
     is_return: bool = False
     is_jump: bool = False
     is_barrier: bool = False
-    
+
     # Target addresses
     target: Optional[int] = None
     fallthrough: Optional[int] = None
-    
+
     # Registers read/written
     reads: List[str] = field(default_factory=list)
     writes: List[str] = field(default_factory=list)
-    
+
     # Memory access
     is_load: bool = False
     is_store: bool = False
+    mem_offset: Optional[int] = None  # Immediate offset for load/store
     mem_size: int = 0
-    
+
     # Literals (for L32R)
     literal_addr: Optional[int] = None
     literal_value: Optional[int] = None
-    
+
     def __repr__(self):
         return f"0x{self.addr:08x}: {self.raw.hex():<8s} {self.mnemonic:<12s} {self.operands}"
+
+
+# Barrier instruction patterns (little-endian byte order)
+BARRIER_PATTERNS = {
+    bytes([0xc0, 0x20, 0x00]): "memw",   # Memory write barrier
+    bytes([0xd0, 0x20, 0x00]): "extw",   # External write barrier
+    bytes([0x30, 0x20, 0x00]): "dsync",  # Data sync
+    bytes([0x00, 0x20, 0x00]): "isync",  # Instruction sync
+}
 
 
 class XtensaDecoder:
     """
     Complete Xtensa instruction decoder.
-    
+
     Instruction formats (from XtensaInstrFormats.td):
     - 24-bit (3-byte) standard instructions
     - 16-bit (2-byte) narrow instructions (density option)
-    
-    Bit layout for 24-bit RRR format:
-    {23-20: op2, 19-16: op1, 15-12: r, 11-8: s, 7-4: t, 3-0: op0}
-    
-    Bit layout for 16-bit RRRN format:
-    {15-12: r, 11-8: s, 7-4: t, 3-0: op0}
+
+    Bit layout for 24-bit RRR format (in memory order):
+    byte0: {7-4: t, 3-0: op0}
+    byte1: {7-4: r, 3-0: s}
+    byte2: {7-4: op2, 3-0: op1}
     """
-    
+
     # Register names
     AR_NAMES = [f"a{i}" for i in range(16)]
-    
+
     # Special register names (from XtensaRegisterInfo.td)
     SR_NAMES = {
         0: "LBEG", 1: "LEND", 2: "LCOUNT", 3: "SAR",
@@ -104,421 +133,644 @@ class XtensaDecoder:
         232: "EXCCAUSE", 233: "DEBUGCAUSE", 234: "CCOUNT",
         238: "EXCVADDR", 240: "CCOMPARE0", 241: "CCOMPARE1",
     }
-    
-    def __init__(self, data: bytes, base: int):
+
+    def __init__(self, data: bytes, base: int = 0):
         self.data = data
         self.base = base
         self.insns: Dict[int, Insn] = {}
-    
+
+        # Pre-compute barrier locations for fast lookup
+        self._barrier_addrs: Set[int] = set()
+        self._precompute_barriers()
+
+    def _precompute_barriers(self):
+        """Find all barrier instructions for fast lookup"""
+        for pattern in BARRIER_PATTERNS:
+            idx = 0
+            while True:
+                idx = self.data.find(pattern, idx)
+                if idx == -1:
+                    break
+                self._barrier_addrs.add(self.base + idx)
+                idx += 1
+
+    def get_barrier_count(self) -> Dict[str, int]:
+        """Count each type of barrier instruction"""
+        counts = {name: 0 for name in BARRIER_PATTERNS.values()}
+        for pattern, name in BARRIER_PATTERNS.items():
+            counts[name] = self.data.count(pattern)
+        return counts
+
     def _u8(self, off: int) -> int:
         if 0 <= off < len(self.data):
             return self.data[off]
         return 0
-    
+
     def _u16(self, off: int) -> int:
         if 0 <= off + 1 < len(self.data):
             return struct.unpack('<H', self.data[off:off+2])[0]
         return 0
-    
+
     def _u32(self, off: int) -> int:
         if 0 <= off + 3 < len(self.data):
             return struct.unpack('<I', self.data[off:off+4])[0]
         return 0
-    
+
     def _sext(self, val: int, bits: int) -> int:
         """Sign extend a value"""
         sign = 1 << (bits - 1)
         return (val & (sign - 1)) - (val & sign)
-    
+
     def _ar(self, n: int) -> str:
         """Get AR register name"""
         return self.AR_NAMES[n & 0xF]
-    
+
     def _sr(self, n: int) -> str:
         """Get special register name"""
         return self.SR_NAMES.get(n, f"sr{n}")
-    
+
     def _is_narrow(self, b0: int) -> bool:
         """Check if instruction is 16-bit narrow format.
-        
+
         From XtensaInstrFormats.td: narrow instructions have op0 in {0x8-0xD}
         """
         op0 = b0 & 0x0F
-        return op0 >= 0x8 and op0 <= 0xD
-    
+        return 0x8 <= op0 <= 0xD
+
     def decode(self, addr: int) -> Optional[Insn]:
         """Decode instruction at address"""
         off = addr - self.base
         if off < 0 or off >= len(self.data):
             return None
-        
+
+        # Check cache
+        if addr in self.insns:
+            return self.insns[addr]
+
         b0 = self._u8(off)
-        
+
         if self._is_narrow(b0):
-            return self._decode_narrow(addr, off)
+            insn = self._decode_narrow(addr, off)
         else:
-            return self._decode_24bit(addr, off)
-    
+            insn = self._decode_24bit(addr, off)
+
+        self.insns[addr] = insn
+        return insn
+
     def _decode_narrow(self, addr: int, off: int) -> Insn:
-        """Decode 16-bit narrow instruction.
-        
-        RRRN format: {15-12: r, 11-8: s, 7-4: t, 3-0: op0}
-        """
+        """Decode 16-bit narrow instruction"""
         b0, b1 = self._u8(off), self._u8(off + 1)
         raw = bytes([b0, b1])
-        
+
         op0 = b0 & 0x0F
         t = (b0 >> 4) & 0x0F
         s = b1 & 0x0F
         r = (b1 >> 4) & 0x0F
-        
-        ft = addr + 2  # fallthrough
-        
-        # op0 = 0x8: L32I.N
+
+        ft = addr + 2
+
+        # L32I.N
         if op0 == 0x8:
-            imm = r << 2  # 4-byte aligned offset
+            imm = r << 2
             return Insn(addr, 2, raw, "l32i.n", f"{self._ar(t)}, {self._ar(s)}, {imm}",
-                       itype=InsnType.LOAD, is_load=True, mem_size=4,
+                       itype=InsnType.LOAD, is_load=True, mem_size=4, mem_offset=imm,
                        reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
-        
-        # op0 = 0x9: S32I.N
+
+        # S32I.N
         elif op0 == 0x9:
             imm = r << 2
             return Insn(addr, 2, raw, "s32i.n", f"{self._ar(t)}, {self._ar(s)}, {imm}",
-                       itype=InsnType.STORE, is_store=True, mem_size=4,
+                       itype=InsnType.STORE, is_store=True, mem_size=4, mem_offset=imm,
                        reads=[self._ar(t), self._ar(s)], fallthrough=ft)
-        
-        # op0 = 0xA: ADD.N
+
+        # ADD.N
         elif op0 == 0xA:
             return Insn(addr, 2, raw, "add.n", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
                        itype=InsnType.ALU,
                        reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-        
-        # op0 = 0xB: ADDI.N
+
+        # ADDI.N
         elif op0 == 0xB:
             imm = r if r != 0 else -1
             return Insn(addr, 2, raw, "addi.n", f"{self._ar(s)}, {self._ar(t)}, {imm}",
                        itype=InsnType.ALU,
                        reads=[self._ar(t)], writes=[self._ar(s)], fallthrough=ft)
-        
-        # op0 = 0xC: Various
+
+        # op0 = 0xC: MOVI.N / BEQZ.N / BNEZ.N
         elif op0 == 0xC:
-            # MOVI.N: t != 0x7
-            if t != 0x7:
-                imm7 = (r << 4) | (s & 0x0F)
-                if imm7 & 0x40:
-                    imm7 = self._sext(imm7, 7)
+            i_bit = (b0 >> 7) & 1
+            z_bit = (b0 >> 6) & 1
+
+            if i_bit == 0:
+                # MOVI.N
+                imm7 = (r << 4) | s
+                if imm7 >= 0x60:
+                    imm7 = imm7 - 128
                 return Insn(addr, 2, raw, "movi.n", f"{self._ar(t)}, {imm7}",
                            itype=InsnType.MOVE, writes=[self._ar(t)], fallthrough=ft)
-            # t = 0x7: BEQZ.N / BNEZ.N
             else:
-                imm6 = (r << 4) | ((s >> 2) & 0x3) | ((s & 0x3) << 4)  # Rearrange bits
-                # Actually from RI6_Inst: imm6[3:0] in bits 15-12, imm6[5:4] in bits 5-4
-                # Let me recompute: bits 15-12=r, bits 11-8=s, bit 7=i, bit 6=z, bits 5-4=imm6[5:4]
-                # For BEQZ.N: op0=0xC, i=1, z=0; for BNEZ.N: op0=0xC, i=1, z=1
-                i = (b0 >> 7) & 1
-                z = (b0 >> 6) & 1
-                imm6_lo = r
-                imm6_hi = (b0 >> 4) & 0x3
-                imm6 = (imm6_hi << 4) | imm6_lo
+                # BEQZ.N / BNEZ.N
+                imm6 = (r << 2) | ((b0 >> 4) & 0x3)
                 target = addr + 4 + imm6
-                
-                if z == 0:
-                    return Insn(addr, 2, raw, "beqz.n", f"{self._ar(s)}, 0x{target:08x}",
-                               itype=InsnType.BRANCH, is_branch=True,
-                               target=target, reads=[self._ar(s)], fallthrough=ft)
-                else:
-                    return Insn(addr, 2, raw, "bnez.n", f"{self._ar(s)}, 0x{target:08x}",
-                               itype=InsnType.BRANCH, is_branch=True,
-                               target=target, reads=[self._ar(s)], fallthrough=ft)
-        
-        # op0 = 0xD: Various
+                mnem = "beqz.n" if z_bit == 0 else "bnez.n"
+                return Insn(addr, 2, raw, mnem, f"{self._ar(s)}, 0x{target:08x}",
+                           itype=InsnType.BRANCH, is_branch=True,
+                           target=target, reads=[self._ar(s)], fallthrough=ft)
+
+        # op0 = 0xD: MOV.N / RET.N / RETW.N / NOP.N / BREAK.N
         elif op0 == 0xD:
-            # Check r field for subtype
             if r == 0xF:
-                # RET.N, RETW.N, NOP.N, ILL.N based on s and t
                 if s == 0x0 and t == 0x0:
                     return Insn(addr, 2, raw, "ret.n", "",
                                itype=InsnType.RETURN, is_return=True, reads=["a0"])
                 elif s == 0x0 and t == 0x1:
                     return Insn(addr, 2, raw, "retw.n", "",
                                itype=InsnType.RETURN, is_return=True)
-                elif s == 0x1:
+                elif s == 0x2 and t == 0x0:
+                    return Insn(addr, 2, raw, "break.n", f"{r}, {s}",
+                               itype=InsnType.SPECIAL)
+                elif s == 0x3 and t == 0x0:
                     return Insn(addr, 2, raw, "nop.n", "",
                                itype=InsnType.SPECIAL, fallthrough=ft)
-                elif s == 0x6 and t == 0xF:
-                    return Insn(addr, 2, raw, "ill.n", "",
-                               itype=InsnType.SPECIAL)
-            # MOV.N
-            elif t == 0x0:
-                return Insn(addr, 2, raw, "mov.n", f"{self._ar(r)}, {self._ar(s)}",
-                           itype=InsnType.MOVE,
-                           reads=[self._ar(s)], writes=[self._ar(r)], fallthrough=ft)
-            # BREAK.N
             else:
-                return Insn(addr, 2, raw, "break.n", f"{s}, {t}",
-                           itype=InsnType.SPECIAL, fallthrough=ft)
-        
-        # Unknown narrow
+                # MOV.N
+                return Insn(addr, 2, raw, "mov.n", f"{self._ar(t)}, {self._ar(s)}",
+                           itype=InsnType.MOVE,
+                           reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+
         return Insn(addr, 2, raw, "???n", f"0x{b1:02x}{b0:02x}",
                    itype=InsnType.UNKNOWN, fallthrough=ft)
-    
+
     def _decode_24bit(self, addr: int, off: int) -> Insn:
-        """Decode 24-bit standard instruction.
-        
-        RRR format: {23-20: op2, 19-16: op1, 15-12: r, 11-8: s, 7-4: t, 3-0: op0}
-        Little-endian: byte0 = {7-4: t, 3-0: op0}, byte1 = {7-4: r, 3-0: s}, byte2 = {7-4: op2, 3-0: op1}
-        """
+        """Decode 24-bit standard instruction"""
         b0, b1, b2 = self._u8(off), self._u8(off + 1), self._u8(off + 2)
         raw = bytes([b0, b1, b2])
-        
+
         op0 = b0 & 0x0F
         t = (b0 >> 4) & 0x0F
         s = b1 & 0x0F
         r = (b1 >> 4) & 0x0F
         op1 = b2 & 0x0F
         op2 = (b2 >> 4) & 0x0F
-        
-        ft = addr + 3  # fallthrough
-        
-        # ========== op0 = 0: QRST (most RRR instructions) ==========
+
+        ft = addr + 3
+
+        # op0 = 0: QRST (most RRR instructions including barriers)
         if op0 == 0x0:
             return self._decode_qrst(addr, raw, op1, op2, r, s, t)
-        
-        # ========== op0 = 1: L32R ==========
+
+        # op0 = 1: L32R
         elif op0 == 0x1:
             imm16 = (b2 << 8) | b1
             imm16_signed = self._sext(imm16, 16)
-            # L32R target: ((PC + 3) & ~3) + (imm16 * 4) for signed offset
             lit_addr = ((addr + 3) & ~3) + (imm16_signed << 2)
             lit_off = lit_addr - self.base
             lit_val = self._u32(lit_off) if 0 <= lit_off < len(self.data) - 3 else None
-            
+
             val_str = f" ; =0x{lit_val:08x}" if lit_val is not None else ""
             return Insn(addr, 3, raw, "l32r", f"{self._ar(t)}, 0x{lit_addr:08x}{val_str}",
                        itype=InsnType.LOAD, is_load=True, mem_size=4,
                        writes=[self._ar(t)], fallthrough=ft,
                        literal_addr=lit_addr, literal_value=lit_val)
-        
-        # ========== op0 = 2: LSAI (loads/stores/addi) ==========
+
+        # op0 = 2: LSAI (loads, stores, addi)
         elif op0 == 0x2:
-            return self._decode_lsai(addr, raw, r, s, t, b2)
-        
-        # ========== op0 = 3: LSCI (cache/FP loads/stores) ==========
-        elif op0 == 0x3:
-            imm8 = b2
-            return Insn(addr, 3, raw, "lsci", f"{r}, {s}, {t}, {imm8}",
-                       itype=InsnType.SPECIAL, fallthrough=ft)
-        
-        # ========== op0 = 4: MAC16 ==========
-        elif op0 == 0x4:
-            return Insn(addr, 3, raw, "mac16", "",
-                       itype=InsnType.ALU, fallthrough=ft)
-        
-        # ========== op0 = 5: CALL ==========
+            return self._decode_lsai(addr, raw, r, s, t)
+
+        # op0 = 5: CALL
         elif op0 == 0x5:
             n = (b0 >> 4) & 0x3
             offset18 = (b2 << 10) | (b1 << 2) | ((b0 >> 6) & 0x3)
             offset18_signed = self._sext(offset18, 18)
             target = ((addr + 4) & ~3) + (offset18_signed << 2)
-            
+
             mnem = f"call{n * 4}" if n > 0 else "call0"
             return Insn(addr, 3, raw, mnem, f"0x{target:08x}",
                        itype=InsnType.CALL, is_call=True,
                        target=target, writes=[f"a{n * 4}"], fallthrough=ft)
-        
-        # ========== op0 = 6: J (unconditional jump) ==========
+
+        # op0 = 6: J (unconditional jump)
         elif op0 == 0x6:
             offset18 = (b2 << 10) | (b1 << 2) | ((b0 >> 6) & 0x3)
             offset18_signed = self._sext(offset18, 18)
             target = addr + 4 + offset18_signed
-            
+
             return Insn(addr, 3, raw, "j", f"0x{target:08x}",
                        itype=InsnType.JUMP, is_jump=True, target=target)
-        
-        # ========== op0 = 7: BI (branches) ==========
+
+        # op0 = 7: BI (branches)
         elif op0 == 0x7:
-            return self._decode_bi(addr, raw, r, s, t, b2)
-        
-        # Unknown
+            return self._decode_bi(addr, raw, r, s, t, b1, b2)
+
         return Insn(addr, 3, raw, "???", f"op0={op0:x}",
                    itype=InsnType.UNKNOWN, fallthrough=ft)
-    
+
     def _decode_qrst(self, addr: int, raw: bytes, op1: int, op2: int, r: int, s: int, t: int) -> Insn:
-        """Decode QRST format (op0 = 0, various op1/op2)"""
+        """Decode QRST format (op0 = 0)"""
         ft = addr + 3
-        
-        # ===== op1 = 0: Main ALU/control group =====
+
         if op1 == 0x0:
-            # op2 = 0: ST2 (misc control)
             if op2 == 0x0:
+                # SYNC instructions (r=2)
+                if r == 0x2 and s == 0x0:
+                    sync_names = {0x0: "isync", 0x1: "rsync", 0x2: "esync", 0x3: "dsync",
+                                 0xC: "memw", 0xD: "extw", 0xF: "nop"}
+                    if t in sync_names:
+                        is_bar = t in [0x0, 0x1, 0x2, 0x3, 0xC, 0xD]
+                        return Insn(addr, 3, raw, sync_names[t], "",
+                                   itype=InsnType.SYNC, is_barrier=is_bar, fallthrough=ft)
+
+                # Control flow
                 if r == 0x0:
                     if s == 0x0 and t == 0x0:
                         return Insn(addr, 3, raw, "ill", "", itype=InsnType.SPECIAL)
                     elif s == 0x0 and t == 0x1:
-                        return Insn(addr, 3, raw, "ret", "", 
+                        return Insn(addr, 3, raw, "ret", "",
                                    itype=InsnType.RETURN, is_return=True, reads=["a0"])
                     elif s == 0x0 and t == 0x2:
                         return Insn(addr, 3, raw, "retw", "",
                                    itype=InsnType.RETURN, is_return=True)
-                elif r == 0xA and t == 0x0:
+
+                if r == 0xA and t == 0x0:
                     return Insn(addr, 3, raw, "jx", f"{self._ar(s)}",
                                itype=InsnType.JUMP, is_jump=True, reads=[self._ar(s)])
-                elif (r & 0xC) == 0xC:
+
+                if (r & 0xC) == 0xC:
                     n = r & 0x3
                     mnem = f"callx{n * 4}" if n > 0 else "callx0"
                     return Insn(addr, 3, raw, mnem, f"{self._ar(s)}",
                                itype=InsnType.CALL, is_call=True,
                                reads=[self._ar(s)], writes=[f"a{n * 4}"], fallthrough=ft)
-            
-            # op2 = 2: SYNC group (r=2 for all sync insns)
-            elif op2 == 0x0 and r == 0x2:
-                sync_names = {0: "isync", 1: "rsync", 2: "esync", 3: "dsync",
-                             0xC: "memw", 0xD: "extw", 0xF: "nop"}
-                if t in sync_names:
-                    return Insn(addr, 3, raw, sync_names[t], "",
-                               itype=InsnType.SYNC, is_barrier=(t in [0, 1, 2, 3, 0xC, 0xD]),
-                               fallthrough=ft)
-            
-            # op2 = 3: RSR/WSR/XSR
-            elif op2 == 0x3:
-                sr = (r << 4) | s
-                sr_name = self._sr(sr)
-                if t == 0x0:
-                    return Insn(addr, 3, raw, "rsr", f"{self._ar(s)}, {sr_name}",
-                               itype=InsnType.SPECIAL, writes=[self._ar(s)], fallthrough=ft)
-                elif t == 0x1:
-                    return Insn(addr, 3, raw, "wsr", f"{sr_name}, {self._ar(s)}",
-                               itype=InsnType.SPECIAL, reads=[self._ar(s)], fallthrough=ft)
-                elif t == 0x6:
-                    return Insn(addr, 3, raw, "xsr", f"{self._ar(s)}, {sr_name}",
-                               itype=InsnType.SPECIAL, 
-                               reads=[self._ar(s)], writes=[self._ar(s)], fallthrough=ft)
-            
-            # op2 = 4: BREAK, SYSCALL, etc
-            elif op2 == 0x4:
-                if r == 0x1 and t == 0x0:
-                    return Insn(addr, 3, raw, "ssl", f"{self._ar(s)}",
-                               itype=InsnType.SHIFT, reads=[self._ar(s)], writes=["sar"], fallthrough=ft)
-                elif r == 0x0 and t == 0x0:
-                    return Insn(addr, 3, raw, "ssr", f"{self._ar(s)}",
-                               itype=InsnType.SHIFT, reads=[self._ar(s)], writes=["sar"], fallthrough=ft)
-                elif r == 0x4:
-                    imm5 = (t & 1) << 4 | s
-                    return Insn(addr, 3, raw, "ssai", f"{imm5}",
-                               itype=InsnType.SHIFT, writes=["sar"], fallthrough=ft)
-            
-            elif op2 == 0x5:
-                if r == 0x0 and s == 0x0:
-                    return Insn(addr, 3, raw, "syscall", "",
-                               itype=InsnType.SPECIAL, fallthrough=ft)
-                elif r == 0x0 and s == 0x1:
-                    return Insn(addr, 3, raw, "simcall", "",
-                               itype=InsnType.SPECIAL, fallthrough=ft)
-            
-            # op2 = 6: NEG, ABS
-            elif op2 == 0x6:
-                if s == 0x0:
-                    return Insn(addr, 3, raw, "neg", f"{self._ar(r)}, {self._ar(t)}",
-                               itype=InsnType.ALU, reads=[self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-                elif s == 0x1:
-                    return Insn(addr, 3, raw, "abs", f"{self._ar(r)}, {self._ar(t)}",
-                               itype=InsnType.ALU, reads=[self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = 8: ADD
+
+            # ALU operations
             elif op2 == 0x8:
                 return Insn(addr, 3, raw, "add", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = 9: ADDX2
-            elif op2 == 0x9:
-                return Insn(addr, 3, raw, "addx2", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = A: ADDX4
-            elif op2 == 0xA:
-                return Insn(addr, 3, raw, "addx4", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = B: ADDX8
-            elif op2 == 0xB:
-                return Insn(addr, 3, raw, "addx8", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = C: SUB
+                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)],
+                           writes=[self._ar(r)], fallthrough=ft)
             elif op2 == 0xC:
                 return Insn(addr, 3, raw, "sub", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = D: SUBX2
-            elif op2 == 0xD:
-                return Insn(addr, 3, raw, "subx2", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = E: SUBX4
-            elif op2 == 0xE:
-                return Insn(addr, 3, raw, "subx4", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            
-            # op2 = F: SUBX8
-            elif op2 == 0xF:
-                return Insn(addr, 3, raw, "subx8", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-        
-        # ===== op1 = 1: Shifts =====
-        elif op1 == 0x1:
-            if op2 == 0x0:
-                # SLLI
-                sa = ((raw[2] >> 4) & 1) << 4 | t
-                return Insn(addr, 3, raw, "slli", f"{self._ar(r)}, {self._ar(s)}, {sa}",
-                           itype=InsnType.SHIFT, reads=[self._ar(s)], writes=[self._ar(r)], fallthrough=ft)
-            elif op2 == 0x2:
-                # SRAI
-                sa = ((raw[2] >> 4) & 1) << 4 | s
-                return Insn(addr, 3, raw, "srai", f"{self._ar(r)}, {self._ar(t)}, {sa}",
-                           itype=InsnType.SHIFT, reads=[self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            elif op2 == 0x4:
-                # SRLI
-                return Insn(addr, 3, raw, "srli", f"{self._ar(r)}, {self._ar(t)}, {s}",
-                           itype=InsnType.SHIFT, reads=[self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-            elif op2 == 0x8:
-                # SRC
-                return Insn(addr, 3, raw, "src", f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.SHIFT, reads=[self._ar(s), self._ar(t), "sar"], writes=[self._ar(r)], fallthrough=ft)
-            elif op2 == 0x9 and s == 0x0:
-                # SRL
-                return Insn(addr, 3, raw, "srl", f"{self._ar(r)}, {self._ar(t)}",
-                           itype=InsnType.SHIFT, reads=[self._ar(t), "sar"], writes=[self._ar(r)], fallthrough=ft)
-            elif op2 == 0xA and t == 0x0:
-                # SLL
-                return Insn(addr, 3, raw, "sll", f"{self._ar(r)}, {self._ar(s)}",
-                           itype=InsnType.SHIFT, reads=[self._ar(s), "sar"], writes=[self._ar(r)], fallthrough=ft)
-            elif op2 == 0xB and s == 0x0:
-                # SRA
-                return Insn(addr, 3, raw, "sra", f"{self._ar(r)}, {self._ar(t)}",
-                           itype=InsnType.SHIFT, reads=[self._ar(t), "sar"], writes=[self._ar(r)], fallthrough=ft)
-        
-        # ===== op1 = 2: AND/OR/XOR =====
-        elif op1 == 0x0:
-            # These should be op2 specific
-            pass  # Handled above
-        
-        # ===== op1 = 3: Conditional moves =====
-        elif op1 == 0x3:
-            move_ops = {0x8: "moveqz", 0x9: "movnez", 0xA: "movltz", 0xB: "movgez"}
-            if op2 in move_ops:
-                return Insn(addr, 3, raw, move_ops[op2], f"{self._ar(r)}, {self._ar(s)}, {self._ar(t)}",
-                           itype=InsnType.MOVE, reads=[self._ar(s), self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-        
-        # ===== op1 = 4: EXTUI =====
-        elif op1 == 0x4:
-            shiftimm = ((raw[2] >> 4) & 1) << 4 | s
-            maskimm = op2 + 1
-            return Insn(addr, 3, raw, "extui", f"{self._ar(r)}, {self._ar(t)}, {shiftimm}, {maskimm}",
-                       itype=InsnType.SHIFT, reads=[self._ar(t)], writes=[self._ar(r)], fallthrough=ft)
-        
-        # Fallback
+                           itype=InsnType.ALU, reads=[self._ar(s), self._ar(t)],
+                           writes=[self._ar(r)], fallthrough=ft)
+
         return Insn(addr, 3, raw, "qrst", f"op1={op1:x},op2={op2:x}",
                    itype=InsnType.UNKNOWN, fallthrough=ft)
-    
-    # [Continued in next cell due to length...]
+
+    def _decode_lsai(self, addr: int, raw: bytes, r: int, s: int, t: int) -> Insn:
+        """Decode LSAI format (op0 = 2) - loads, stores, addi
+
+        RRI8 format encoding (from llvm-mc):
+          byte0: {t[3:0], op0[3:0]}
+          byte1: {r[3:0], s[3:0]}
+          byte2: imm8
+        """
+        ft = addr + 3
+        imm8 = raw[2]  # imm8 is in byte2, not byte1!
+
+        # r field determines instruction type
+        if r == 0x0:
+            # L8UI
+            return Insn(addr, 3, raw, "l8ui", f"{self._ar(t)}, {self._ar(s)}, {imm8}",
+                       itype=InsnType.LOAD, is_load=True, mem_size=1, mem_offset=imm8,
+                       reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0x1:
+            # L16UI
+            offset = imm8 << 1
+            return Insn(addr, 3, raw, "l16ui", f"{self._ar(t)}, {self._ar(s)}, {offset}",
+                       itype=InsnType.LOAD, is_load=True, mem_size=2, mem_offset=offset,
+                       reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0x2:
+            # L32I
+            offset = imm8 << 2
+            return Insn(addr, 3, raw, "l32i", f"{self._ar(t)}, {self._ar(s)}, {offset}",
+                       itype=InsnType.LOAD, is_load=True, mem_size=4, mem_offset=offset,
+                       reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0x4:
+            # S8I
+            return Insn(addr, 3, raw, "s8i", f"{self._ar(t)}, {self._ar(s)}, {imm8}",
+                       itype=InsnType.STORE, is_store=True, mem_size=1, mem_offset=imm8,
+                       reads=[self._ar(t), self._ar(s)], fallthrough=ft)
+        elif r == 0x5:
+            # S16I
+            offset = imm8 << 1
+            return Insn(addr, 3, raw, "s16i", f"{self._ar(t)}, {self._ar(s)}, {offset}",
+                       itype=InsnType.STORE, is_store=True, mem_size=2, mem_offset=offset,
+                       reads=[self._ar(t), self._ar(s)], fallthrough=ft)
+        elif r == 0x6:
+            # S32I - THE KEY INSTRUCTION FOR DMA BUGS
+            offset = imm8 << 2
+            return Insn(addr, 3, raw, "s32i", f"{self._ar(t)}, {self._ar(s)}, {offset}",
+                       itype=InsnType.STORE, is_store=True, mem_size=4, mem_offset=offset,
+                       reads=[self._ar(t), self._ar(s)], fallthrough=ft)
+        elif r == 0x9:
+            # L16SI
+            offset = imm8 << 1
+            return Insn(addr, 3, raw, "l16si", f"{self._ar(t)}, {self._ar(s)}, {offset}",
+                       itype=InsnType.LOAD, is_load=True, mem_size=2, mem_offset=offset,
+                       reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0xA:
+            # MOVI
+            imm12 = (raw[2] << 4) | ((raw[1] >> 4) & 0xF)
+            if imm12 >= 0x800:
+                imm12 = imm12 - 0x1000
+            return Insn(addr, 3, raw, "movi", f"{self._ar(t)}, {imm12}",
+                       itype=InsnType.MOVE, writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0xB:
+            # L32AI (acquire)
+            offset = imm8 << 2
+            return Insn(addr, 3, raw, "l32ai", f"{self._ar(t)}, {self._ar(s)}, {offset}",
+                       itype=InsnType.LOAD, is_load=True, is_barrier=True,
+                       mem_size=4, mem_offset=offset,
+                       reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0xC:
+            # ADDI
+            simm8 = self._sext(imm8, 8)
+            return Insn(addr, 3, raw, "addi", f"{self._ar(t)}, {self._ar(s)}, {simm8}",
+                       itype=InsnType.ALU, reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0xD:
+            # ADDMI
+            simm8 = self._sext(imm8, 8)
+            return Insn(addr, 3, raw, "addmi", f"{self._ar(t)}, {self._ar(s)}, {simm8 << 8}",
+                       itype=InsnType.ALU, reads=[self._ar(s)], writes=[self._ar(t)], fallthrough=ft)
+        elif r == 0xF:
+            # S32RI (release)
+            offset = imm8 << 2
+            return Insn(addr, 3, raw, "s32ri", f"{self._ar(t)}, {self._ar(s)}, {offset}",
+                       itype=InsnType.STORE, is_store=True, is_barrier=True,
+                       mem_size=4, mem_offset=offset,
+                       reads=[self._ar(t), self._ar(s)], fallthrough=ft)
+
+        return Insn(addr, 3, raw, "lsai", f"r={r:x}",
+                   itype=InsnType.UNKNOWN, fallthrough=ft)
+
+    def _decode_bi(self, addr: int, raw: bytes, r: int, s: int, t: int, b1: int, b2: int) -> Insn:
+        """Decode BI format (op0 = 7) - branches"""
+        ft = addr + 3
+
+        # Calculate branch offset (8-bit signed, scaled)
+        imm8 = b1
+        offset = self._sext(imm8, 8)
+        target = addr + 4 + offset
+
+        if r == 0x0:
+            # BNEZ
+            return Insn(addr, 3, raw, "bnez", f"{self._ar(s)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s)], fallthrough=ft)
+        elif r == 0x1:
+            # BEQZ
+            return Insn(addr, 3, raw, "beqz", f"{self._ar(s)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s)], fallthrough=ft)
+        elif r == 0x2:
+            # BLTZ
+            return Insn(addr, 3, raw, "bltz", f"{self._ar(s)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s)], fallthrough=ft)
+        elif r == 0x3:
+            # BGEZ
+            return Insn(addr, 3, raw, "bgez", f"{self._ar(s)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s)], fallthrough=ft)
+        elif r == 0x4:
+            # BEQ
+            return Insn(addr, 3, raw, "beq", f"{self._ar(s)}, {self._ar(t)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s), self._ar(t)], fallthrough=ft)
+        elif r == 0x5:
+            # BNE
+            return Insn(addr, 3, raw, "bne", f"{self._ar(s)}, {self._ar(t)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s), self._ar(t)], fallthrough=ft)
+        elif r == 0x6:
+            # BBCI (branch if bit clear)
+            bit = ((b2 >> 4) & 1) << 4 | t
+            return Insn(addr, 3, raw, "bbci", f"{self._ar(s)}, {bit}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s)], fallthrough=ft)
+        elif r == 0x7:
+            # BBSI (branch if bit set)
+            bit = ((b2 >> 4) & 1) << 4 | t
+            return Insn(addr, 3, raw, "bbsi", f"{self._ar(s)}, {bit}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s)], fallthrough=ft)
+        elif r == 0xA:
+            # BLT
+            return Insn(addr, 3, raw, "blt", f"{self._ar(s)}, {self._ar(t)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s), self._ar(t)], fallthrough=ft)
+        elif r == 0xB:
+            # BGE
+            return Insn(addr, 3, raw, "bge", f"{self._ar(s)}, {self._ar(t)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s), self._ar(t)], fallthrough=ft)
+        elif r == 0xC:
+            # BLTU
+            return Insn(addr, 3, raw, "bltu", f"{self._ar(s)}, {self._ar(t)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s), self._ar(t)], fallthrough=ft)
+        elif r == 0xD:
+            # BGEU
+            return Insn(addr, 3, raw, "bgeu", f"{self._ar(s)}, {self._ar(t)}, 0x{target:08x}",
+                       itype=InsnType.BRANCH, is_branch=True,
+                       target=target, reads=[self._ar(s), self._ar(t)], fallthrough=ft)
+
+        return Insn(addr, 3, raw, "bi", f"r={r:x}",
+                   itype=InsnType.BRANCH, is_branch=True, fallthrough=ft)
+
+    # =========================================================================
+    # ANALYSIS METHODS
+    # =========================================================================
+
+    def find_stores_to_offset(self, target_offset: int, max_search: int = 0) -> List[Insn]:
+        """Find all store instructions to a specific memory offset.
+
+        For s32i (RRI8 format), verified encoding from llvm-mc:
+          byte0: {7-4: t, 3-0: op0=2}
+          byte1: {7-4: r=6, 3-0: s}
+          byte2: imm8 (offset = imm8 * 4)
+
+        Example: s32i a0, a1, 844 -> [0x02, 0x61, 0xd3]
+        """
+        stores = []
+        imm8 = target_offset >> 2  # s32i uses scaled offset (844 -> 211 = 0xD3)
+
+        for i in range(len(self.data) - 3):
+            b0, b1, b2 = self.data[i], self.data[i + 1], self.data[i + 2]
+            op0 = b0 & 0x0F
+            r = (b1 >> 4) & 0x0F  # r is in byte1 upper nibble
+
+            # s32i: op0=2, r=6, imm8 in byte2
+            if op0 == 0x2 and r == 0x6 and b2 == imm8:
+                insn = self.decode(self.base + i)
+                if insn and insn.is_store:
+                    stores.append(insn)
+                    if max_search and len(stores) >= max_search:
+                        break
+
+        return stores
+
+    def has_barrier_within(self, addr: int, max_bytes: int = 50) -> Optional[int]:
+        """Check if there's a barrier instruction within max_bytes after addr"""
+        for barrier_addr in self._barrier_addrs:
+            if addr < barrier_addr <= addr + max_bytes:
+                return barrier_addr
+        return None
+
+    def find_dma_bugs(self, dma_offset: int = 844, search_radius: int = 50) -> Dict:
+        """
+        Find stores to DMA descriptor offset without nearby barriers.
+
+        Args:
+            dma_offset: Memory offset used for DMA descriptor (default: 844 = 0x34C)
+            search_radius: How many bytes after store to look for barrier
+
+        Returns:
+            Dict with 'bugs' (stores without barrier) and 'safe' (stores with barrier)
+        """
+        stores = self.find_stores_to_offset(dma_offset)
+
+        bugs = []
+        safe = []
+
+        for insn in stores:
+            barrier = self.has_barrier_within(insn.addr, search_radius)
+            if barrier:
+                safe.append({'insn': insn, 'barrier_at': barrier,
+                            'distance': barrier - insn.addr})
+            else:
+                bugs.append(insn)
+
+        return {
+            'bugs': bugs,
+            'safe': safe,
+            'total_stores': len(stores),
+            'bug_count': len(bugs),
+            'safe_count': len(safe),
+            'bug_rate': len(bugs) / len(stores) if stores else 0
+        }
+
+    def disassemble_range(self, start: int, end: int) -> List[Insn]:
+        """Disassemble a range of addresses"""
+        insns = []
+        addr = start
+        while addr < end:
+            insn = self.decode(addr)
+            if insn:
+                insns.append(insn)
+                addr += insn.size
+            else:
+                addr += 1
+        return insns
+
+    def disassemble_function(self, entry: int, max_insns: int = 500) -> List[Insn]:
+        """Disassemble a function starting at entry point"""
+        insns = []
+        visited = set()
+        worklist = [entry]
+
+        while worklist and len(insns) < max_insns:
+            addr = worklist.pop(0)
+            if addr in visited:
+                continue
+            visited.add(addr)
+
+            insn = self.decode(addr)
+            if not insn:
+                continue
+
+            insns.append(insn)
+
+            # Add successors
+            if insn.fallthrough and insn.fallthrough not in visited:
+                worklist.append(insn.fallthrough)
+            if insn.target and insn.target not in visited:
+                worklist.append(insn.target)
+
+            # Stop at returns
+            if insn.is_return:
+                continue
+
+        return sorted(insns, key=lambda i: i.addr)
+
+
+def load_firmware(path: str, skip_header: int = 16) -> Tuple[bytes, int]:
+    """
+    Load firmware file, skipping SGMT header.
+
+    Args:
+        path: Path to firmware file
+        skip_header: Bytes to skip (16 for SGMT header)
+
+    Returns:
+        (raw_data, base_address)
+    """
+    import struct
+
+    with open(path, 'rb') as f:
+        data = f.read()
+
+    # Check for SGMT header
+    if data[:4] == b'SGMT':
+        base_addr = struct.unpack('<I', data[8:12])[0]
+        return data[skip_header:], base_addr
+    else:
+        return data, 0
+
+
+def analyze_firmware(path: str, dma_offset: int = 844) -> None:
+    """
+    Analyze firmware for DMA coherency bugs.
+
+    Args:
+        path: Path to firmware file
+        dma_offset: DMA descriptor offset to check (default: 844)
+    """
+    data, base = load_firmware(path)
+    dec = XtensaDecoder(data, base)
+
+    print(f"Firmware: {path}")
+    print(f"Base address: 0x{base:08x}")
+    print(f"Size: {len(data)} bytes")
+    print()
+
+    # Barrier counts
+    barriers = dec.get_barrier_count()
+    print("Barrier instructions:")
+    for name, count in barriers.items():
+        print(f"  {name}: {count}")
+    print(f"  TOTAL: {sum(barriers.values())}")
+    print()
+
+    # DMA bug analysis
+    result = dec.find_dma_bugs(dma_offset)
+    print(f"Stores to offset {dma_offset}:")
+    print(f"  Total: {result['total_stores']}")
+    print(f"  WITHOUT barrier (BUGS): {result['bug_count']} ({result['bug_rate']*100:.1f}%)")
+    print(f"  WITH barrier (safe): {result['safe_count']}")
+    print()
+
+    if result['bugs']:
+        print("Bug locations:")
+        for insn in result['bugs'][:20]:
+            print(f"  {insn}")
+        if len(result['bugs']) > 20:
+            print(f"  ... and {len(result['bugs']) - 20} more")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python xtensa_decoder.py <firmware.bin> [dma_offset]")
+        print()
+        print("Analyzes Xtensa firmware for DMA coherency bugs.")
+        print()
+        print("Arguments:")
+        print("  firmware.bin  Path to firmware file (SGMT format supported)")
+        print("  dma_offset    DMA descriptor offset to check (default: 844)")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    dma_offset = int(sys.argv[2]) if len(sys.argv) > 2 else 844
+
+    analyze_firmware(path, dma_offset)

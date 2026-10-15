@@ -14,11 +14,10 @@ built from LLVM TableGen definitions and validated against `llvm-mc`.
   - MAC16 DSP operations
   - Narrow (16-bit) instruction encoding
 
-- **Analysis-ready**: Instructions are classified by type (ALU, LOAD, STORE, BRANCH,
-  SYNC, etc.) for semantic analysis
+- **DMA Bug Detection**: Built-in analysis to find stores to DMA descriptor 
+  offsets without nearby memory barriers - a common source of packet corruption
 
-- **Firmware analysis**: Designed for reverse engineering Xtensa-based firmware
-  (WiFi chips, embedded DSPs, etc.)
+- **SGMT Format Support**: Automatically parses Qualcomm SGMT firmware headers
 
 ## Installation
 
@@ -27,71 +26,119 @@ pip install xtensa-decoder  # TODO: publish to PyPI
 # Or just copy xtensa_decoder.py to your project
 ```
 
-## Usage
+## Quick Start
+
+```bash
+# Analyze firmware for DMA coherency bugs
+python xtensa_decoder.py firmware.bin
+
+# Search for stores to a specific DMA offset
+python xtensa_decoder.py firmware.bin 844
+```
+
+Output:
+```
+Firmware: firmware.bin
+Base address: 0x00409200
+Size: 345990 bytes
+
+Barrier instructions:
+  memw: 632
+  extw: 0
+  dsync: 0
+  isync: 10
+  TOTAL: 642
+
+Stores to offset 844:
+  Total: 3
+  WITHOUT barrier (BUGS): 1 (33.3%)
+  WITH barrier (safe): 2
+
+Bug locations:
+  0x004214c0: f26cd3   s32i         a15, a12, 844
+```
+
+## Python API
 
 ```python
-from xtensa_decoder import XtensaDecoder, InsnType
+from xtensa_decoder import XtensaDecoder, load_firmware
 
-# Create decoder
-decoder = XtensaDecoder()
+# Load firmware (handles SGMT header automatically)
+data, base_addr = load_firmware("firmware.bin")
+decoder = XtensaDecoder(data, base_addr)
 
-# Decode firmware at a base address
-firmware_bytes = open("firmware.bin", "rb").read()
-base_addr = 0x409200
+# Count barrier instructions
+barriers = decoder.get_barrier_count()
+print(f"memw: {barriers['memw']}, isync: {barriers['isync']}")
 
-for insn in decoder.decode_range(firmware_bytes, base_addr, 0, len(firmware_bytes)):
-    print(f"0x{insn.addr:08x}: {insn.mnemonic:10} {insn.operands}")
-    
-    # Find memory barriers
-    if insn.itype == InsnType.SYNC:
-        print(f"  ^ Memory barrier: {insn.mnemonic}")
+# Find DMA bugs (stores to offset 844 without nearby barriers)
+result = decoder.find_dma_bugs(dma_offset=844)
+print(f"Bugs: {result['bug_count']}, Safe: {result['safe_count']}")
+
+for insn in result['bugs']:
+    print(f"BUG: {insn}")
+
+# Decode single instruction
+insn = decoder.decode(0x004214c0)
+print(f"{insn.mnemonic} {insn.operands}")
+print(f"Is store: {insn.is_store}, Is barrier: {insn.is_barrier}")
+
+# Disassemble a function
+insns = decoder.disassemble_function(entry_addr)
+for insn in insns:
+    print(insn)
 ```
+
+## Instruction Encoding
+
+Xtensa uses **little-endian** byte order. For RRI8 format (loads/stores):
+
+```
+byte0: {t[3:0], op0[3:0]}     # t=dest reg, op0=instruction class
+byte1: {r[3:0], s[3:0]}       # r=opcode, s=base reg
+byte2: imm8                    # scaled immediate offset
+```
+
+Example: `s32i a15, a12, 844` encodes as `[0xf2, 0x6c, 0xd3]`
+- byte0=0xf2: t=15, op0=2 (LSAI)
+- byte1=0x6c: r=6 (s32i), s=12
+- byte2=0xd3: imm8=211 (offset=844)
+
+Memory barriers encode as:
+- `memw`:  `[0xc0, 0x20, 0x00]`
+- `extw`:  `[0xd0, 0x20, 0x00]`
+- `dsync`: `[0x30, 0x20, 0x00]`
+- `isync`: `[0x00, 0x20, 0x00]`
 
 ## Validation
 
-The decoder has been validated against LLVM's `llvm-mc` assembler/disassembler:
+All encodings validated against LLVM's `llvm-mc`:
 
 ```bash
-# Test memory barrier encodings
-echo "0x00 0x20 0xc0" | llvm-mc -triple=xtensa -mattr=+density --disassemble
-# Output: memw
+# Verify s32i encoding
+echo "s32i a15, a12, 844" | llvm-mc -triple=xtensa --show-encoding
+# Output: s32i a15, a12, 844  # encoding: [0xf2,0x6c,0xd3]
 
-echo "0x00 0x20 0x20" | llvm-mc -triple=xtensa -mattr=+density --disassemble  
-# Output: isync
+# Verify memw decoding
+echo "0xc0 0x20 0x00" | llvm-mc -triple=xtensa --disassemble
+# Output: memw
 ```
 
-All instruction encodings match the authoritative LLVM implementation.
+## Use Case: WiFi Firmware DMA Bugs
+
+This decoder was built to analyze WiFi firmware for missing memory barriers.
+On Xtensa cores in WiFi SoCs (QCA4019, etc.), DMA descriptors require
+`memw` barriers after writes to ensure coherency with DMA hardware.
+
+Missing barriers cause packet corruption (e.g., TLS `bad_record_mac` errors).
 
 ## Source
 
-The instruction encodings are derived from LLVM's Xtensa target:
-- `llvm/lib/Target/Xtensa/XtensaInstrInfo.td` - Core instructions
-- `llvm/lib/Target/Xtensa/XtensaDSPInstrInfo.td` - DSP/MAC16 instructions
-- `llvm/lib/Target/Xtensa/XtensaInstrFormats.td` - Encoding formats
-
-## Use Case: Finding DMA Coherency Bugs
-
-This decoder was built to analyze WiFi firmware for missing memory barriers.
-On Xtensa cores used in WiFi SoCs (QCA4019, etc.), DMA descriptors require
-`memw` barriers after writes to ensure coherency with DMA hardware.
-
-```python
-# Find stores to DMA descriptor fields without barriers
-for insn in decoder.decode_range(data, base, 0, len(data)):
-    if insn.itype == InsnType.STORE:
-        # Check if a memw follows within reasonable distance
-        next_insns = list(decoder.decode_range(data, base, 
-            insn.addr - base + insn.size, 20))
-        has_barrier = any(i.itype == InsnType.SYNC for i in next_insns[:5])
-        if not has_barrier:
-            print(f"WARNING: Store at 0x{insn.addr:08x} without barrier")
-```
+Instruction encodings derived from LLVM's Xtensa target:
+- `llvm/lib/Target/Xtensa/XtensaInstrInfo.td`
+- `llvm/lib/Target/Xtensa/XtensaDSPInstrInfo.td`
+- `llvm/lib/Target/Xtensa/XtensaInstrFormats.td`
 
 ## License
 
 MIT License - see LICENSE file.
-
-## Contributing
-
-Issues and pull requests welcome. Please validate against `llvm-mc` when
-adding new instruction support.

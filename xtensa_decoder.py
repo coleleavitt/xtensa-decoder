@@ -692,14 +692,133 @@ class XtensaDecoder:
 
         return sorted(insns, key=lambda i: i.addr)
 
+    def find_functions(self) -> List[int]:
+        """Find all function entry points (addresses with entry instruction)"""
+        functions = []
+        i = 0
+        while i < len(self.data) - 3:
+            b0 = self.data[i]
+            # entry instruction: op0=6, t=3 (encoded as 0x36 in lower 6 bits)
+            if (b0 & 0x3F) == 0x36:
+                functions.append(self.base + i)
+            i += 1
+        return sorted(functions)
 
-def load_firmware(path: str, skip_header: int = 16) -> Tuple[bytes, int]:
+    def get_function_at(self, addr: int) -> Optional[Tuple[int, int]]:
+        """Get the function containing an address.
+
+        Returns (start_addr, approx_end_addr) or None.
+        """
+        functions = self.find_functions()
+
+        # Find the function that contains this address
+        func_start = None
+        for ep in functions:
+            if ep <= addr:
+                func_start = ep
+            else:
+                break
+
+        if func_start is None:
+            return None
+
+        # Find next function for approximate end
+        func_end = None
+        for ep in functions:
+            if ep > func_start:
+                func_end = ep
+                break
+
+        if func_end is None:
+            func_end = func_start + 2000  # Default max size
+
+        return (func_start, func_end)
+
+    def analyze_function_barriers(self, func_addr: int) -> Dict:
+        """Analyze stores and barriers in a function.
+
+        Returns dict with:
+          - stores: count of store instructions
+          - barriers: count of barrier instructions
+          - stores_without_after_barrier: stores lacking barrier within 30 bytes after
+          - offsets: dict of offset -> count for stores
+        """
+        func_info = self.get_function_at(func_addr)
+        if not func_info:
+            return {'error': 'Function not found'}
+
+        start, end = func_info
+        start_off = start - self.base
+        end_off = end - self.base
+
+        stores = []
+        barriers = []
+        memw_pattern = bytes([0xc0, 0x20, 0x00])
+
+        i = start_off
+        while i < min(end_off, len(self.data) - 3):
+            # Check for memw
+            if self.data[i:i+3] == memw_pattern:
+                barriers.append(self.base + i)
+
+            b0 = self.data[i]
+            op0 = b0 & 0x0F
+
+            # s32i (op0=2, r=6)
+            if op0 == 0x2:
+                b1 = self.data[i+1]
+                r = (b1 >> 4) & 0x0F
+                if r == 0x6:
+                    b2 = self.data[i+2]
+                    offset = b2 << 2
+                    stores.append({'addr': self.base + i, 'offset': offset})
+
+            # s32i.n (op0=9)
+            if op0 == 0x9:
+                b1 = self.data[i+1]
+                r = (b1 >> 4) & 0x0F
+                offset = r << 2
+                stores.append({'addr': self.base + i, 'offset': offset})
+
+            i += 2 if op0 >= 0x8 else 3
+
+        # Count stores without after barrier
+        unprotected = 0
+        for store in stores:
+            has_barrier = False
+            for bar in barriers:
+                if store['addr'] < bar <= store['addr'] + 30:
+                    has_barrier = True
+                    break
+            if not has_barrier:
+                unprotected += 1
+
+        # Group by offset
+        from collections import Counter
+        offsets = Counter(s['offset'] for s in stores)
+
+        return {
+            'func_start': start,
+            'func_end': end,
+            'func_size': end - start,
+            'stores': len(stores),
+            'barriers': len(barriers),
+            'stores_without_after_barrier': unprotected,
+            'offsets': dict(offsets),
+            'danger_level': 'CRITICAL' if len(barriers) == 0 and len(stores) > 10 else
+                           'HIGH' if unprotected > len(stores) * 0.8 else
+                           'MEDIUM' if unprotected > len(stores) * 0.5 else 'LOW'
+        }
+
+
+def load_firmware(path: str, skip_header: int = 16, base_addr: Optional[int] = None) -> Tuple[bytes, int]:
     """
     Load firmware file, skipping SGMT header.
 
     Args:
         path: Path to firmware file
         skip_header: Bytes to skip (16 for SGMT header)
+        base_addr: Override base address (use when loading raw/stripped firmware)
 
     Returns:
         (raw_data, base_address)
@@ -711,10 +830,11 @@ def load_firmware(path: str, skip_header: int = 16) -> Tuple[bytes, int]:
 
     # Check for SGMT header
     if data[:4] == b'SGMT':
-        base_addr = struct.unpack('<I', data[8:12])[0]
-        return data[skip_header:], base_addr
+        detected_base = struct.unpack('<I', data[8:12])[0]
+        return data[skip_header:], base_addr if base_addr else detected_base
     else:
-        return data, 0
+        # Raw firmware - use provided base or default for QCA4019
+        return data, base_addr if base_addr else 0x00409200
 
 
 def analyze_firmware(path: str, dma_offset: int = 844) -> None:
